@@ -82,6 +82,8 @@ func convertAudio(inputData []byte, format string) ([]byte, int, error) {
 	switch format {
 	case "mp3":
 		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "mp3", "pipe:1")
+	case "wav":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "wav", "pipe:1")
 	default:
 		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-f", "ogg", "pipe:1")
 	}
