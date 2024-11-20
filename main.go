@@ -83,9 +83,9 @@ func convertAudio(inputData []byte, inputFormat string, outputFormat string) ([]
 	case "mp3":
 		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "mp3", "pipe:1")
 	case "wav":
-			cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "wav", "pipe:1")
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "wav", "pipe:1")
 	default:
-        if inputFormat == "webm" {
+		if inputFormat == "webm" {
             // Custom settings for webm to ogg conversion
 			fmt.Println("Conversão de webm para ogg")
             cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-acodec", "libopus", "-b:a", "16k", "-vbr", "on", "-compression_level", "10", "-ac", "1", "-ar", "16000", "-f", "ogg", "pipe:1")
