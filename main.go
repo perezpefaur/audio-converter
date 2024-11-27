@@ -85,14 +85,7 @@ func convertAudio(inputData []byte, inputFormat string, outputFormat string) ([]
 	case "wav":
 		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "wav", "pipe:1")
 	default:
-		if inputFormat == "webm" {
-            // Custom settings for webm to ogg conversion
-			fmt.Println("Conversão de webm para ogg")
-            cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-acodec", "libopus", "-b:a", "16k", "-vbr", "on", "-compression_level", "10", "-ac", "1", "-ar", "16000", "-f", "ogg", "pipe:1")
-        } else {
-            // Default settings for other formats to ogg
-			cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-acodec", "libopus", "-ac", "1", "-ar", "16000", "-f", "ogg", "pipe:1")
-		}
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-c:a", "libopus", "-b:a", "16k", "-vbr", "on", "-compression_level", "10", "-ac", "1", "-ar", "16000", "-f", "ogg", "pipe:1")
 	}
 	outBuffer := bufferPool.Get().(*bytes.Buffer)
 	errBuffer := bufferPool.Get().(*bytes.Buffer)
