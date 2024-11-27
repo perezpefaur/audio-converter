@@ -84,6 +84,12 @@ func convertAudio(inputData []byte, inputFormat string, outputFormat string) ([]
 		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "mp3", "pipe:1")
 	case "wav":
 		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "wav", "pipe:1")
+	case "aac":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-c:a", "aac", "-b:a", "128k", "-f", "adts", "pipe:1")
+	case "amr":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-c:a", "libopencore_amrnb", "-b:a", "12.2k", "-f", "amr", "pipe:1")
+	case "m4a":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-c:a", "aac", "-b:a", "128k", "-f", "ipod", "pipe:1")
 	default:
 		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-c:a", "libopus", "-b:a", "16k", "-vbr", "on", "-compression_level", "10", "-ac", "1", "-ar", "16000", "-f", "ogg", "pipe:1")
 	}
