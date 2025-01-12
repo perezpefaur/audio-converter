@@ -1,5 +1,5 @@
 # Usar uma imagem base do Go
-FROM golang:1.21-alpine
+FROM golang:1.22-alpine
 
 # Instalar ffmpeg
 RUN apk update && apk add --no-cache ffmpeg
