@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -150,17 +151,44 @@ func fetchGifFromURL(url string) ([]byte, error) {
 		return nil, errors.New("URL vazia fornecida")
 	}
 
-	resp, err := httpClient.Get(url)
+	fmt.Printf("Intentando descargar GIF desde: %s\n", url)
+
+	// Configurar un cliente HTTP con timeout más largo
+	client := &http.Client{
+		Timeout: 60 * time.Second, // Aumentar timeout a 60 segundos
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("erro ao acessar URL: %v", err)
+		return nil, fmt.Errorf("error al crear solicitud: %v", err)
+	}
+
+	// Agregar User-Agent para evitar restricciones
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error al acceder URL: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status de resposta inválido: %d", resp.StatusCode)
+		return nil, fmt.Errorf("estado de respuesta inválido: %d", resp.StatusCode)
 	}
 
-	return io.ReadAll(resp.Body)
+	fmt.Printf("Descarga iniciada. Content-Length: %s\n", resp.Header.Get("Content-Length"))
+
+	// Leer con un buffer limitado para evitar problemas de memoria
+	var buffer bytes.Buffer
+	_, err = io.Copy(&buffer, resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error al leer datos: %v", err)
+	}
+
+	data := buffer.Bytes()
+	fmt.Printf("Descarga completada. Tamaño: %d bytes\n", len(data))
+
+	return data, nil
 }
 
 func getInputData(c *gin.Context) ([]byte, error) {
@@ -180,7 +208,38 @@ func getInputData(c *gin.Context) ([]byte, error) {
 }
 
 func convertGifToMp4(inputData []byte) ([]byte, error) {
-	cmd := exec.Command("ffmpeg", "-i", "pipe:0", "-movflags", "faststart", "-pix_fmt", "yuv420p", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-f", "mp4", "pipe:1")
+	// Log the size of the input data
+	fmt.Printf("Tamaño de datos GIF de entrada: %d bytes\n", len(inputData))
+
+	// Verificar que los datos de entrada no estén vacíos
+	if len(inputData) == 0 {
+		return nil, errors.New("datos de entrada vacíos")
+	}
+
+	// Guardar los primeros bytes para verificar el formato
+	headerBytes := 16
+	if len(inputData) < headerBytes {
+		headerBytes = len(inputData)
+	}
+	fmt.Printf("Primeros %d bytes: %v\n", headerBytes, inputData[:headerBytes])
+
+	// Para archivos grandes, usar archivos temporales en lugar de pipes
+	if len(inputData) > 10*1024*1024 { // Si es mayor a 10MB
+		return convertGifToMp4UsingTempFiles(inputData)
+	}
+
+	// Usar un comando más simple para la conversión
+	cmd := exec.Command("ffmpeg",
+		"-i", "pipe:0",           // Entrada desde pipe
+		"-movflags", "faststart", // Optimizar para streaming
+		"-pix_fmt", "yuv420p",    // Formato de pixel compatible
+		"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", // Asegurar dimensiones pares
+		"-f", "mp4",              // Formato de salida
+		"-c:v", "libx264",        // Codec de video
+		"-preset", "fast",        // Preset de codificación
+		"-crf", "23",             // Calidad de video
+		"-y",                     // Sobrescribir archivos sin preguntar
+		"pipe:1")                 // Salida a pipe
 
 	outBuffer := bufferPool.Get().(*bytes.Buffer)
 	errBuffer := bufferPool.Get().(*bytes.Buffer)
@@ -194,15 +253,94 @@ func convertGifToMp4(inputData []byte) ([]byte, error) {
 	cmd.Stdout = outBuffer
 	cmd.Stderr = errBuffer
 
+	fmt.Println("Ejecutando comando FFmpeg para convertir GIF a MP4...")
 	err := cmd.Run()
 	if err != nil {
-		return nil, fmt.Errorf("error during conversion: %v, details: %s", err, errBuffer.String())
+		errorDetails := errBuffer.String()
+		fmt.Printf("Error durante la conversión: %v\n", err)
+		fmt.Printf("Detalles del error FFmpeg: %s\n", errorDetails)
+		return nil, fmt.Errorf("error during conversion: %v, details: %s", err, errorDetails)
 	}
 
+	// Verificar que la salida no esté vacía
+	if outBuffer.Len() == 0 {
+		fmt.Println("La conversión produjo un archivo de salida vacío")
+		return nil, errors.New("la conversión produjo un archivo de salida vacío")
+	}
+
+	fmt.Printf("Conversión exitosa. Tamaño del MP4: %d bytes\n", outBuffer.Len())
 	convertedData := make([]byte, outBuffer.Len())
 	copy(convertedData, outBuffer.Bytes())
 
 	return convertedData, nil
+}
+
+// Función para convertir GIF a MP4 usando archivos temporales para archivos grandes
+func convertGifToMp4UsingTempFiles(inputData []byte) ([]byte, error) {
+	fmt.Println("Usando archivos temporales para la conversión de GIF grande")
+
+	// Crear archivo temporal para entrada
+	inputFile, err := os.CreateTemp("", "input-*.gif")
+	if err != nil {
+		return nil, fmt.Errorf("error al crear archivo temporal de entrada: %v", err)
+	}
+	inputPath := inputFile.Name()
+	defer os.Remove(inputPath) // Limpiar al finalizar
+
+	// Escribir datos de entrada al archivo temporal
+	_, err = inputFile.Write(inputData)
+	if err != nil {
+		inputFile.Close()
+		return nil, fmt.Errorf("error al escribir en archivo temporal: %v", err)
+	}
+	inputFile.Close()
+
+	// Crear archivo temporal para salida
+	outputFile, err := os.CreateTemp("", "output-*.mp4")
+	if err != nil {
+		return nil, fmt.Errorf("error al crear archivo temporal de salida: %v", err)
+	}
+	outputPath := outputFile.Name()
+	outputFile.Close() // Cerrar para que ffmpeg pueda escribir en él
+	defer os.Remove(outputPath) // Limpiar al finalizar
+
+	// Ejecutar ffmpeg con archivos temporales
+	cmd := exec.Command("ffmpeg",
+		"-i", inputPath,          // Archivo de entrada
+		"-movflags", "faststart", // Optimizar para streaming
+		"-pix_fmt", "yuv420p",    // Formato de pixel compatible
+		"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", // Asegurar dimensiones pares
+		"-f", "mp4",              // Formato de salida
+		"-c:v", "libx264",        // Codec de video
+		"-preset", "fast",        // Preset de codificación
+		"-crf", "23",             // Calidad de video
+		"-y",                     // Sobrescribir sin preguntar
+		outputPath)               // Archivo de salida
+
+	// Capturar salida de error
+	var errBuffer bytes.Buffer
+	cmd.Stderr = &errBuffer
+
+	fmt.Println("Ejecutando FFmpeg con archivos temporales...")
+	err = cmd.Run()
+	if err != nil {
+		fmt.Printf("Error durante la conversión con archivos temporales: %v\n", err)
+		fmt.Printf("Detalles del error: %s\n", errBuffer.String())
+		return nil, fmt.Errorf("error en conversión con archivos temporales: %v, detalles: %s", err, errBuffer.String())
+	}
+
+	// Leer archivo de salida
+	outputData, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("error al leer archivo de salida: %v", err)
+	}
+
+	if len(outputData) == 0 {
+		return nil, errors.New("la conversión produjo un archivo de salida vacío")
+	}
+
+	fmt.Printf("Conversión con archivos temporales exitosa. Tamaño del MP4: %d bytes\n", len(outputData))
+	return outputData, nil
 }
 
 func processAudio(c *gin.Context) {
@@ -233,6 +371,48 @@ func processAudio(c *gin.Context) {
 }
 
 func processGifToMp4(c *gin.Context) {
+	// Función para manejar errores y responder al cliente
+	handleError := func(statusCode int, err error, source string) {
+		errorMsg := err.Error()
+		fmt.Printf("Error en %s: %v\n", source, err)
+		c.JSON(statusCode, gin.H{"error": errorMsg})
+	}
+
+	// Función para procesar la conversión y responder al cliente
+	processConversion := func(inputData []byte, source string) {
+		fmt.Printf("Procesando GIF desde %s (%d bytes)\n", source, len(inputData))
+
+		// Implementar recuperación de pánico
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Recuperado de pánico en conversión: %v\n", r)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": fmt.Sprintf("Error interno durante la conversión: %v", r),
+				})
+			}
+		}()
+
+		convertedData, err := convertGifToMp4(inputData)
+		if err != nil {
+			handleError(http.StatusInternalServerError, err, "conversión")
+			return
+		}
+
+		// Verificar que los datos convertidos no estén vacíos
+		if len(convertedData) == 0 {
+			handleError(http.StatusInternalServerError,
+				errors.New("la conversión produjo un archivo vacío"), "validación de salida")
+			return
+		}
+
+		fmt.Printf("Conversión exitosa. Enviando respuesta (%d bytes)\n", len(convertedData))
+		c.JSON(http.StatusOK, gin.H{
+			"video": base64.StdEncoding.EncodeToString(convertedData),
+			"format": "mp4",
+		})
+	}
+
+	// Validar API Key
 	if !validateAPIKey(c) {
 		return
 	}
@@ -246,21 +426,10 @@ func processGifToMp4(c *gin.Context) {
 		fmt.Printf("URL encontrada en form-data: %s\n", formUrl)
 		inputData, err := fetchGifFromURL(formUrl)
 		if err != nil {
-			fmt.Printf("Error al obtener GIF de URL (form): %v\n", err)
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			handleError(http.StatusBadRequest, err, "obtención de GIF (form)")
 			return
 		}
-
-		convertedData, err := convertGifToMp4(inputData)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"video": base64.StdEncoding.EncodeToString(convertedData),
-			"format": "mp4",
-		})
+		processConversion(inputData, "form-data")
 		return
 	}
 
@@ -270,21 +439,10 @@ func processGifToMp4(c *gin.Context) {
 		fmt.Printf("URL encontrada en query params: %s\n", queryUrl)
 		inputData, err := fetchGifFromURL(queryUrl)
 		if err != nil {
-			fmt.Printf("Error al obtener GIF de URL (query): %v\n", err)
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			handleError(http.StatusBadRequest, err, "obtención de GIF (query)")
 			return
 		}
-
-		convertedData, err := convertGifToMp4(inputData)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"video": base64.StdEncoding.EncodeToString(convertedData),
-			"format": "mp4",
-		})
+		processConversion(inputData, "query params")
 		return
 	}
 
@@ -296,21 +454,10 @@ func processGifToMp4(c *gin.Context) {
 		fmt.Printf("URL encontrada en JSON: %s\n", jsonData.URL)
 		inputData, err := fetchGifFromURL(jsonData.URL)
 		if err != nil {
-			fmt.Printf("Error al obtener GIF de URL (json): %v\n", err)
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			handleError(http.StatusBadRequest, err, "obtención de GIF (json)")
 			return
 		}
-
-		convertedData, err := convertGifToMp4(inputData)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"video": base64.StdEncoding.EncodeToString(convertedData),
-			"format": "mp4",
-		})
+		processConversion(inputData, "JSON")
 		return
 	}
 
@@ -318,21 +465,10 @@ func processGifToMp4(c *gin.Context) {
 	fmt.Println("No se encontró URL, intentando otros métodos de entrada")
 	inputData, err := getInputData(c)
 	if err != nil {
-		fmt.Printf("Error al obtener datos de entrada: %v\n", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		handleError(http.StatusBadRequest, err, "obtención de datos de entrada")
 		return
 	}
-
-	convertedData, err := convertGifToMp4(inputData)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"video": base64.StdEncoding.EncodeToString(convertedData),
-		"format": "mp4",
-	})
+	processConversion(inputData, "otros métodos")
 }
 
 func validateOrigin(origin string) bool {
