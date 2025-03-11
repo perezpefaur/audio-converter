@@ -145,6 +145,24 @@ func fetchAudioFromURL(url string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
+func fetchGifFromURL(url string) ([]byte, error) {
+	if url == "" {
+		return nil, errors.New("URL vazia fornecida")
+	}
+
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao acessar URL: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status de resposta inválido: %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
 func getInputData(c *gin.Context) ([]byte, error) {
 	if file, _, err := c.Request.FormFile("file"); err == nil {
 		return io.ReadAll(file)
@@ -219,6 +237,28 @@ func processGifToMp4(c *gin.Context) {
 		return
 	}
 
+	// Verificar si hay una URL en el formulario
+	if url := c.PostForm("url"); url != "" {
+		inputData, err := fetchGifFromURL(url)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		convertedData, err := convertGifToMp4(inputData)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"video": base64.StdEncoding.EncodeToString(convertedData),
+			"format": "mp4",
+		})
+		return
+	}
+
+	// Si no hay URL, intentar otros métodos de entrada
 	inputData, err := getInputData(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
