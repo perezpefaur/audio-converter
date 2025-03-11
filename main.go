@@ -223,61 +223,14 @@ func convertGifToMp4(inputData []byte) ([]byte, error) {
 	}
 	fmt.Printf("Primeros %d bytes: %v\n", headerBytes, inputData[:headerBytes])
 
-	// Para archivos grandes, usar archivos temporales en lugar de pipes
-	if len(inputData) > 10*1024*1024 { // Si es mayor a 10MB
-		return convertGifToMp4UsingTempFiles(inputData)
-	}
-
-	// Usar un comando más simple para la conversión
-	cmd := exec.Command("ffmpeg",
-		"-i", "pipe:0",           // Entrada desde pipe
-		"-movflags", "faststart", // Optimizar para streaming
-		"-pix_fmt", "yuv420p",    // Formato de pixel compatible
-		"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", // Asegurar dimensiones pares
-		"-f", "mp4",              // Formato de salida
-		"-c:v", "libx264",        // Codec de video
-		"-preset", "fast",        // Preset de codificación
-		"-crf", "23",             // Calidad de video
-		"-y",                     // Sobrescribir archivos sin preguntar
-		"pipe:1")                 // Salida a pipe
-
-	outBuffer := bufferPool.Get().(*bytes.Buffer)
-	errBuffer := bufferPool.Get().(*bytes.Buffer)
-	defer bufferPool.Put(outBuffer)
-	defer bufferPool.Put(errBuffer)
-
-	outBuffer.Reset()
-	errBuffer.Reset()
-
-	cmd.Stdin = bytes.NewReader(inputData)
-	cmd.Stdout = outBuffer
-	cmd.Stderr = errBuffer
-
-	fmt.Println("Ejecutando comando FFmpeg para convertir GIF a MP4...")
-	err := cmd.Run()
-	if err != nil {
-		errorDetails := errBuffer.String()
-		fmt.Printf("Error durante la conversión: %v\n", err)
-		fmt.Printf("Detalles del error FFmpeg: %s\n", errorDetails)
-		return nil, fmt.Errorf("error during conversion: %v, details: %s", err, errorDetails)
-	}
-
-	// Verificar que la salida no esté vacía
-	if outBuffer.Len() == 0 {
-		fmt.Println("La conversión produjo un archivo de salida vacío")
-		return nil, errors.New("la conversión produjo un archivo de salida vacío")
-	}
-
-	fmt.Printf("Conversión exitosa. Tamaño del MP4: %d bytes\n", outBuffer.Len())
-	convertedData := make([]byte, outBuffer.Len())
-	copy(convertedData, outBuffer.Bytes())
-
-	return convertedData, nil
+	// Siempre usar archivos temporales para MP4 porque el formato requiere seeking
+	// que no es posible con pipes
+	return convertGifToMp4UsingTempFiles(inputData)
 }
 
-// Función para convertir GIF a MP4 usando archivos temporales para archivos grandes
+// Función para convertir GIF a MP4 usando archivos temporales
 func convertGifToMp4UsingTempFiles(inputData []byte) ([]byte, error) {
-	fmt.Println("Usando archivos temporales para la conversión de GIF grande")
+	fmt.Println("Usando archivos temporales para la conversión de GIF a MP4")
 
 	// Crear archivo temporal para entrada
 	inputFile, err := os.CreateTemp("", "input-*.gif")
@@ -285,15 +238,19 @@ func convertGifToMp4UsingTempFiles(inputData []byte) ([]byte, error) {
 		return nil, fmt.Errorf("error al crear archivo temporal de entrada: %v", err)
 	}
 	inputPath := inputFile.Name()
-	defer os.Remove(inputPath) // Limpiar al finalizar
+	defer func() {
+		inputFile.Close()
+		os.Remove(inputPath) // Limpiar al finalizar
+		fmt.Printf("Archivo temporal de entrada eliminado: %s\n", inputPath)
+	}()
 
 	// Escribir datos de entrada al archivo temporal
-	_, err = inputFile.Write(inputData)
+	bytesWritten, err := inputFile.Write(inputData)
 	if err != nil {
-		inputFile.Close()
 		return nil, fmt.Errorf("error al escribir en archivo temporal: %v", err)
 	}
-	inputFile.Close()
+	fmt.Printf("Datos escritos en archivo temporal: %d bytes en %s\n", bytesWritten, inputPath)
+	inputFile.Close() // Cerrar archivo después de escribir
 
 	// Crear archivo temporal para salida
 	outputFile, err := os.CreateTemp("", "output-*.mp4")
@@ -302,7 +259,17 @@ func convertGifToMp4UsingTempFiles(inputData []byte) ([]byte, error) {
 	}
 	outputPath := outputFile.Name()
 	outputFile.Close() // Cerrar para que ffmpeg pueda escribir en él
-	defer os.Remove(outputPath) // Limpiar al finalizar
+	defer func() {
+		os.Remove(outputPath) // Limpiar al finalizar
+		fmt.Printf("Archivo temporal de salida eliminado: %s\n", outputPath)
+	}()
+
+	// Verificar que el archivo de entrada existe y tiene tamaño
+	inputInfo, err := os.Stat(inputPath)
+	if err != nil {
+		return nil, fmt.Errorf("error al verificar archivo de entrada: %v", err)
+	}
+	fmt.Printf("Archivo de entrada verificado: %s (tamaño: %d bytes)\n", inputPath, inputInfo.Size())
 
 	// Ejecutar ffmpeg con archivos temporales
 	cmd := exec.Command("ffmpeg",
@@ -312,7 +279,7 @@ func convertGifToMp4UsingTempFiles(inputData []byte) ([]byte, error) {
 		"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", // Asegurar dimensiones pares
 		"-f", "mp4",              // Formato de salida
 		"-c:v", "libx264",        // Codec de video
-		"-preset", "fast",        // Preset de codificación
+		"-preset", "ultrafast",   // Preset de codificación más rápido
 		"-crf", "23",             // Calidad de video
 		"-y",                     // Sobrescribir sin preguntar
 		outputPath)               // Archivo de salida
@@ -322,12 +289,21 @@ func convertGifToMp4UsingTempFiles(inputData []byte) ([]byte, error) {
 	cmd.Stderr = &errBuffer
 
 	fmt.Println("Ejecutando FFmpeg con archivos temporales...")
+	fmt.Printf("Comando: %v\n", cmd.Args)
+
 	err = cmd.Run()
 	if err != nil {
 		fmt.Printf("Error durante la conversión con archivos temporales: %v\n", err)
 		fmt.Printf("Detalles del error: %s\n", errBuffer.String())
 		return nil, fmt.Errorf("error en conversión con archivos temporales: %v, detalles: %s", err, errBuffer.String())
 	}
+
+	// Verificar que el archivo de salida existe y tiene tamaño
+	outputInfo, err := os.Stat(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("error al verificar archivo de salida: %v", err)
+	}
+	fmt.Printf("Archivo de salida verificado: %s (tamaño: %d bytes)\n", outputPath, outputInfo.Size())
 
 	// Leer archivo de salida
 	outputData, err := os.ReadFile(outputPath)
