@@ -161,6 +161,32 @@ func getInputData(c *gin.Context) ([]byte, error) {
 	return nil, errors.New("nenhum arquivo, base64 ou URL fornecido")
 }
 
+func convertGifToMp4(inputData []byte) ([]byte, error) {
+	cmd := exec.Command("ffmpeg", "-i", "pipe:0", "-movflags", "faststart", "-pix_fmt", "yuv420p", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-f", "mp4", "pipe:1")
+
+	outBuffer := bufferPool.Get().(*bytes.Buffer)
+	errBuffer := bufferPool.Get().(*bytes.Buffer)
+	defer bufferPool.Put(outBuffer)
+	defer bufferPool.Put(errBuffer)
+
+	outBuffer.Reset()
+	errBuffer.Reset()
+
+	cmd.Stdin = bytes.NewReader(inputData)
+	cmd.Stdout = outBuffer
+	cmd.Stderr = errBuffer
+
+	err := cmd.Run()
+	if err != nil {
+		return nil, fmt.Errorf("error during conversion: %v, details: %s", err, errBuffer.String())
+	}
+
+	convertedData := make([]byte, outBuffer.Len())
+	copy(convertedData, outBuffer.Bytes())
+
+	return convertedData, nil
+}
+
 func processAudio(c *gin.Context) {
 	if !validateAPIKey(c) {
 		return
@@ -185,6 +211,29 @@ func processAudio(c *gin.Context) {
 		"duration": duration,
 		"audio":    base64.StdEncoding.EncodeToString(convertedData),
 		"format":   outputFormat,
+	})
+}
+
+func processGifToMp4(c *gin.Context) {
+	if !validateAPIKey(c) {
+		return
+	}
+
+	inputData, err := getInputData(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	convertedData, err := convertGifToMp4(inputData)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"video": base64.StdEncoding.EncodeToString(convertedData),
+		"format": "mp4",
 	})
 }
 
@@ -234,6 +283,7 @@ func main() {
 	router.Use(originMiddleware())
 
 	router.POST("/process-audio", processAudio)
+	router.POST("/gif-to-mp4", processGifToMp4)
 
 	router.Run(":" + port)
 }
