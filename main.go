@@ -237,10 +237,66 @@ func processGifToMp4(c *gin.Context) {
 		return
 	}
 
+	// Log para depuración
+	fmt.Printf("Recibida solicitud GIF a MP4. Content-Type: %s\n", c.ContentType())
+
 	// Verificar si hay una URL en el formulario
-	if url := c.PostForm("url"); url != "" {
-		inputData, err := fetchGifFromURL(url)
+	formUrl := c.PostForm("url")
+	if formUrl != "" {
+		fmt.Printf("URL encontrada en form-data: %s\n", formUrl)
+		inputData, err := fetchGifFromURL(formUrl)
 		if err != nil {
+			fmt.Printf("Error al obtener GIF de URL (form): %v\n", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		convertedData, err := convertGifToMp4(inputData)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"video": base64.StdEncoding.EncodeToString(convertedData),
+			"format": "mp4",
+		})
+		return
+	}
+
+	// Verificar si hay una URL en los parámetros de consulta
+	queryUrl := c.Query("url")
+	if queryUrl != "" {
+		fmt.Printf("URL encontrada en query params: %s\n", queryUrl)
+		inputData, err := fetchGifFromURL(queryUrl)
+		if err != nil {
+			fmt.Printf("Error al obtener GIF de URL (query): %v\n", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		convertedData, err := convertGifToMp4(inputData)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"video": base64.StdEncoding.EncodeToString(convertedData),
+			"format": "mp4",
+		})
+		return
+	}
+
+	// Verificar si hay datos en JSON
+	var jsonData struct {
+		URL string `json:"url"`
+	}
+	if err := c.ShouldBindJSON(&jsonData); err == nil && jsonData.URL != "" {
+		fmt.Printf("URL encontrada en JSON: %s\n", jsonData.URL)
+		inputData, err := fetchGifFromURL(jsonData.URL)
+		if err != nil {
+			fmt.Printf("Error al obtener GIF de URL (json): %v\n", err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -259,8 +315,10 @@ func processGifToMp4(c *gin.Context) {
 	}
 
 	// Si no hay URL, intentar otros métodos de entrada
+	fmt.Println("No se encontró URL, intentando otros métodos de entrada")
 	inputData, err := getInputData(c)
 	if err != nil {
+		fmt.Printf("Error al obtener datos de entrada: %v\n", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
