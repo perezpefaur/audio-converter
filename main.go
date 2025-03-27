@@ -476,6 +476,216 @@ func originMiddleware() gin.HandlerFunc {
 	}
 }
 
+func convertVideoToMp4(inputData []byte, inputFormat string) ([]byte, error) {
+	fmt.Printf("Iniciando conversión de video %s a MP4 (%d bytes)\n", inputFormat, len(inputData))
+
+	// Siempre usar archivos temporales para MP4 porque el formato requiere seeking
+	// que no es posible con pipes
+	return convertVideoToMp4UsingTempFiles(inputData, inputFormat)
+}
+
+// Función para convertir video a MP4 usando archivos temporales
+func convertVideoToMp4UsingTempFiles(inputData []byte, inputFormat string) ([]byte, error) {
+	fmt.Println("Usando archivos temporales para la conversión de video a MP4")
+
+	// Crear archivo temporal para entrada
+	inputFile, err := os.CreateTemp("", fmt.Sprintf("input-*.%s", inputFormat))
+	if err != nil {
+		return nil, fmt.Errorf("error al crear archivo temporal de entrada: %v", err)
+	}
+	inputPath := inputFile.Name()
+	defer func() {
+		inputFile.Close()
+		os.Remove(inputPath) // Limpiar al finalizar
+		fmt.Printf("Archivo temporal de entrada eliminado: %s\n", inputPath)
+	}()
+
+	// Escribir datos de entrada al archivo temporal
+	bytesWritten, err := inputFile.Write(inputData)
+	if err != nil {
+		return nil, fmt.Errorf("error al escribir en archivo temporal: %v", err)
+	}
+	fmt.Printf("Datos escritos en archivo temporal: %d bytes en %s\n", bytesWritten, inputPath)
+	inputFile.Close() // Cerrar archivo después de escribir
+
+	// Crear archivo temporal para salida
+	outputFile, err := os.CreateTemp("", "output-*.mp4")
+	if err != nil {
+		return nil, fmt.Errorf("error al crear archivo temporal de salida: %v", err)
+	}
+	outputPath := outputFile.Name()
+	outputFile.Close() // Cerrar para que ffmpeg pueda escribir en él
+	defer func() {
+		os.Remove(outputPath) // Limpiar al finalizar
+		fmt.Printf("Archivo temporal de salida eliminado: %s\n", outputPath)
+	}()
+
+	// Verificar que el archivo de entrada existe y tiene tamaño
+	inputInfo, err := os.Stat(inputPath)
+	if err != nil {
+		return nil, fmt.Errorf("error al verificar archivo de entrada: %v", err)
+	}
+	fmt.Printf("Archivo de entrada verificado: %s (tamaño: %d bytes)\n", inputPath, inputInfo.Size())
+
+	// Ejecutar ffmpeg con archivos temporales
+	cmd := exec.Command("ffmpeg",
+		"-i", inputPath,          // Archivo de entrada
+		"-movflags", "faststart", // Optimizar para streaming
+		"-pix_fmt", "yuv420p",    // Formato de pixel compatible
+		"-c:v", "libx264",        // Codec de video
+		"-preset", "ultrafast",   // Preset de codificación más rápido
+		"-crf", "23",             // Calidad de video
+		"-c:a", "aac",            // Codec de audio
+		"-b:a", "128k",           // Bitrate de audio
+		"-y",                     // Sobrescribir sin preguntar
+		outputPath)               // Archivo de salida
+
+	// Capturar salida de error
+	var errBuffer bytes.Buffer
+	cmd.Stderr = &errBuffer
+
+	fmt.Println("Ejecutando FFmpeg para conversión de video...")
+	fmt.Printf("Comando: %v\n", cmd.Args)
+
+	err = cmd.Run()
+	if err != nil {
+		fmt.Printf("Error durante la conversión de video: %v\n", err)
+		fmt.Printf("Detalles del error: %s\n", errBuffer.String())
+		return nil, fmt.Errorf("error en conversión de video: %v, detalles: %s", err, errBuffer.String())
+	}
+
+	// Verificar que el archivo de salida existe y tiene tamaño
+	outputInfo, err := os.Stat(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("error al verificar archivo de salida: %v", err)
+	}
+	fmt.Printf("Archivo de salida verificado: %s (tamaño: %d bytes)\n", outputPath, outputInfo.Size())
+
+	// Leer archivo de salida
+	outputData, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("error al leer archivo de salida: %v", err)
+	}
+
+	if len(outputData) == 0 {
+		return nil, errors.New("la conversión produjo un archivo de salida vacío")
+	}
+
+	fmt.Printf("Conversión de video exitosa. Tamaño del MP4: %d bytes\n", len(outputData))
+	return outputData, nil
+}
+
+func processVideoToMp4(c *gin.Context) {
+	// Función para manejar errores y responder al cliente
+	handleError := func(statusCode int, err error, source string) {
+		errorMsg := err.Error()
+		fmt.Printf("Error en %s: %v\n", source, err)
+		c.JSON(statusCode, gin.H{"error": errorMsg})
+	}
+
+	// Función para procesar la conversión y responder al cliente
+	processConversion := func(inputData []byte, inputFormat string, source string) {
+		fmt.Printf("Procesando video %s desde %s (%d bytes)\n", inputFormat, source, len(inputData))
+
+		// Implementar recuperación de pánico
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Recuperado de pánico en conversión: %v\n", r)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": fmt.Sprintf("Error interno durante la conversión: %v", r),
+				})
+			}
+		}()
+
+		convertedData, err := convertVideoToMp4(inputData, inputFormat)
+		if err != nil {
+			handleError(http.StatusInternalServerError, err, "conversión")
+			return
+		}
+
+		// Verificar que los datos convertidos no estén vacíos
+		if len(convertedData) == 0 {
+			handleError(http.StatusInternalServerError,
+				errors.New("la conversión produjo un archivo vacío"), "validación de salida")
+			return
+		}
+
+		fmt.Printf("Conversión exitosa. Enviando respuesta (%d bytes)\n", len(convertedData))
+		c.JSON(http.StatusOK, gin.H{
+			"video": base64.StdEncoding.EncodeToString(convertedData),
+			"format": "mp4",
+		})
+	}
+
+	// Validar API Key
+	if !validateAPIKey(c) {
+		return
+	}
+
+	// Log para depuración
+	fmt.Printf("Recibida solicitud de conversión de video a MP4. Content-Type: %s\n", c.ContentType())
+
+	// Obtener formato de entrada
+	inputFormat := c.DefaultPostForm("input_format", "mp4")
+
+	// Verificar si hay una URL en el formulario
+	formUrl := c.PostForm("url")
+	if formUrl != "" {
+		fmt.Printf("URL encontrada en form-data: %s\n", formUrl)
+		inputData, err := fetchAudioFromURL(formUrl) // Reutilizamos la función existente
+		if err != nil {
+			handleError(http.StatusBadRequest, err, "obtención de video (form)")
+			return
+		}
+		processConversion(inputData, inputFormat, "form-data")
+		return
+	}
+
+	// Verificar si hay una URL en los parámetros de consulta
+	queryUrl := c.Query("url")
+	if queryUrl != "" {
+		fmt.Printf("URL encontrada en query params: %s\n", queryUrl)
+		inputData, err := fetchAudioFromURL(queryUrl)
+		if err != nil {
+			handleError(http.StatusBadRequest, err, "obtención de video (query)")
+			return
+		}
+		processConversion(inputData, inputFormat, "query params")
+		return
+	}
+
+	// Verificar si hay datos en JSON
+	var jsonData struct {
+		URL         string `json:"url"`
+		InputFormat string `json:"input_format"`
+	}
+	if err := c.ShouldBindJSON(&jsonData); err == nil && jsonData.URL != "" {
+		fmt.Printf("URL encontrada en JSON: %s\n", jsonData.URL)
+		inputData, err := fetchAudioFromURL(jsonData.URL)
+		if err != nil {
+			handleError(http.StatusBadRequest, err, "obtención de video (json)")
+			return
+		}
+
+		// Usar el formato de entrada del JSON si está disponible
+		if jsonData.InputFormat != "" {
+			inputFormat = jsonData.InputFormat
+		}
+
+		processConversion(inputData, inputFormat, "JSON")
+		return
+	}
+
+	// Si no hay URL, intentar otros métodos de entrada
+	fmt.Println("No se encontró URL, intentando otros métodos de entrada")
+	inputData, err := getInputData(c)
+	if err != nil {
+		handleError(http.StatusBadRequest, err, "obtención de datos de entrada")
+		return
+	}
+	processConversion(inputData, inputFormat, "otros métodos")
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -494,6 +704,7 @@ func main() {
 
 	router.POST("/process-audio", processAudio)
 	router.POST("/gif-to-mp4", processGifToMp4)
+	router.POST("/video-to-mp4", processVideoToMp4)
 
 	router.Run(":" + port)
 }
