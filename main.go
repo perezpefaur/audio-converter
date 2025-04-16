@@ -686,6 +686,246 @@ func processVideoToMp4(c *gin.Context) {
 	processConversion(inputData, inputFormat, "otros métodos")
 }
 
+func convertImageToPng(inputData []byte) ([]byte, error) {
+	fmt.Printf("Iniciando conversión de imagen a PNG (%d bytes)\n", len(inputData))
+
+	// Siempre usar archivos temporales para la conversión de imágenes
+	return convertImageToPngUsingTempFiles(inputData)
+}
+
+// Función para convertir imagen a PNG usando archivos temporales
+func convertImageToPngUsingTempFiles(inputData []byte) ([]byte, error) {
+	fmt.Println("Usando archivos temporales para la conversión de imagen a PNG")
+
+	// Crear archivo temporal para entrada sin extensión específica
+	// para que FFmpeg auto-detecte el formato
+	inputFile, err := os.CreateTemp("", "input-*")
+	if err != nil {
+		return nil, fmt.Errorf("error al crear archivo temporal de entrada: %v", err)
+	}
+	inputPath := inputFile.Name()
+	defer func() {
+		inputFile.Close()
+		os.Remove(inputPath) // Limpiar al finalizar
+		fmt.Printf("Archivo temporal de entrada eliminado: %s\n", inputPath)
+	}()
+
+	// Escribir datos de entrada al archivo temporal
+	bytesWritten, err := inputFile.Write(inputData)
+	if err != nil {
+		return nil, fmt.Errorf("error al escribir en archivo temporal: %v", err)
+	}
+	fmt.Printf("Datos escritos en archivo temporal: %d bytes en %s\n", bytesWritten, inputPath)
+	inputFile.Close() // Cerrar archivo después de escribir
+
+	// Crear archivo temporal para salida PNG
+	outputFile, err := os.CreateTemp("", "output-*.png")
+	if err != nil {
+		return nil, fmt.Errorf("error al crear archivo temporal de salida: %v", err)
+	}
+	outputPath := outputFile.Name()
+	outputFile.Close() // Cerrar para que ffmpeg pueda escribir en él
+	defer func() {
+		os.Remove(outputPath) // Limpiar al finalizar
+		fmt.Printf("Archivo temporal de salida eliminado: %s\n", outputPath)
+	}()
+
+	// Verificar que el archivo de entrada existe y tiene tamaño
+	inputInfo, err := os.Stat(inputPath)
+	if err != nil {
+		return nil, fmt.Errorf("error al verificar archivo de entrada: %v", err)
+	}
+	fmt.Printf("Archivo de entrada verificado: %s (tamaño: %d bytes)\n", inputPath, inputInfo.Size())
+
+	// Configurar comando ffmpeg para convertir a PNG
+	cmd := exec.Command("ffmpeg",
+		"-i", inputPath,          // Archivo de entrada
+		"-f", "image2",           // Formato de imagen
+		"-c:v", "png",            // Codec PNG
+		"-y",                     // Sobrescribir sin preguntar
+		outputPath)               // Archivo de salida
+
+	// Capturar salida de error
+	var errBuffer bytes.Buffer
+	cmd.Stderr = &errBuffer
+
+	fmt.Println("Ejecutando FFmpeg para conversión de imagen a PNG...")
+	fmt.Printf("Comando: %v\n", cmd.Args)
+
+	err = cmd.Run()
+	if err != nil {
+		fmt.Printf("Error durante la conversión de imagen: %v\n", err)
+		fmt.Printf("Detalles del error: %s\n", errBuffer.String())
+		return nil, fmt.Errorf("error en conversión de imagen: %v, detalles: %s", err, errBuffer.String())
+	}
+
+	// Verificar que el archivo de salida existe y tiene tamaño
+	outputInfo, err := os.Stat(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("error al verificar archivo de salida: %v", err)
+	}
+	fmt.Printf("Archivo de salida verificado: %s (tamaño: %d bytes)\n", outputPath, outputInfo.Size())
+
+	// Leer archivo de salida
+	outputData, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("error al leer archivo de salida: %v", err)
+	}
+
+	if len(outputData) == 0 {
+		return nil, errors.New("la conversión produjo un archivo de salida vacío")
+	}
+
+	fmt.Printf("Conversión de imagen a PNG exitosa. Tamaño: %d bytes\n", len(outputData))
+	return outputData, nil
+}
+
+func fetchImageFromURL(url string) ([]byte, error) {
+	if url == "" {
+		return nil, errors.New("URL vacía proporcionada")
+	}
+
+	fmt.Printf("Intentando descargar imagen desde: %s\n", url)
+
+	// Configurar un cliente HTTP con timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error al crear solicitud: %v", err)
+	}
+
+	// Agregar User-Agent para evitar restricciones
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error al acceder URL: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("estado de respuesta inválido: %d", resp.StatusCode)
+	}
+
+	fmt.Printf("Descarga iniciada. Content-Length: %s\n", resp.Header.Get("Content-Length"))
+
+	// Leer con un buffer para evitar problemas de memoria
+	var buffer bytes.Buffer
+	_, err = io.Copy(&buffer, resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error al leer datos: %v", err)
+	}
+
+	data := buffer.Bytes()
+	fmt.Printf("Descarga completada. Tamaño: %d bytes\n", len(data))
+
+	return data, nil
+}
+
+func processImageToPng(c *gin.Context) {
+	// Función para manejar errores y responder al cliente
+	handleError := func(statusCode int, err error, source string) {
+		errorMsg := err.Error()
+		fmt.Printf("Error en %s: %v\n", source, err)
+		c.JSON(statusCode, gin.H{"error": errorMsg})
+	}
+
+	// Función para procesar la conversión y responder al cliente
+	processConversion := func(inputData []byte, source string) {
+		fmt.Printf("Procesando imagen a PNG desde %s (%d bytes)\n", source, len(inputData))
+
+		// Implementar recuperación de pánico
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Recuperado de pánico en conversión: %v\n", r)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": fmt.Sprintf("Error interno durante la conversión: %v", r),
+				})
+			}
+		}()
+
+		convertedData, err := convertImageToPng(inputData)
+		if err != nil {
+			handleError(http.StatusInternalServerError, err, "conversión")
+			return
+		}
+
+		// Verificar que los datos convertidos no estén vacíos
+		if len(convertedData) == 0 {
+			handleError(http.StatusInternalServerError,
+				errors.New("la conversión produjo un archivo vacío"), "validación de salida")
+			return
+		}
+
+		fmt.Printf("Conversión exitosa. Enviando respuesta (%d bytes)\n", len(convertedData))
+		c.JSON(http.StatusOK, gin.H{
+			"image":  base64.StdEncoding.EncodeToString(convertedData),
+			"format": "png",
+		})
+	}
+
+	// Validar API Key
+	if !validateAPIKey(c) {
+		return
+	}
+
+	// Log para depuración
+	fmt.Printf("Recibida solicitud de conversión de imagen a PNG. Content-Type: %s\n", c.ContentType())
+
+	// Verificar si hay una URL en el formulario
+	formUrl := c.PostForm("url")
+	if formUrl != "" {
+		fmt.Printf("URL encontrada en form-data: %s\n", formUrl)
+		inputData, err := fetchImageFromURL(formUrl)
+		if err != nil {
+			handleError(http.StatusBadRequest, err, "obtención de imagen (form)")
+			return
+		}
+		processConversion(inputData, "form-data")
+		return
+	}
+
+	// Verificar si hay una URL en los parámetros de consulta
+	queryUrl := c.Query("url")
+	if queryUrl != "" {
+		fmt.Printf("URL encontrada en query params: %s\n", queryUrl)
+		inputData, err := fetchImageFromURL(queryUrl)
+		if err != nil {
+			handleError(http.StatusBadRequest, err, "obtención de imagen (query)")
+			return
+		}
+		processConversion(inputData, "query params")
+		return
+	}
+
+	// Verificar si hay datos en JSON
+	var jsonData struct {
+		URL string `json:"url"`
+	}
+	if err := c.ShouldBindJSON(&jsonData); err == nil && jsonData.URL != "" {
+		fmt.Printf("URL encontrada en JSON: %s\n", jsonData.URL)
+		inputData, err := fetchImageFromURL(jsonData.URL)
+		if err != nil {
+			handleError(http.StatusBadRequest, err, "obtención de imagen (json)")
+			return
+		}
+		processConversion(inputData, "JSON")
+		return
+	}
+
+	// Si no hay URL, intentar otros métodos de entrada
+	fmt.Println("No se encontró URL, intentando otros métodos de entrada")
+	inputData, err := getInputData(c)
+	if err != nil {
+		handleError(http.StatusBadRequest, err, "obtención de datos de entrada")
+		return
+	}
+	processConversion(inputData, "otros métodos")
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -705,6 +945,7 @@ func main() {
 	router.POST("/process-audio", processAudio)
 	router.POST("/gif-to-mp4", processGifToMp4)
 	router.POST("/video-to-mp4", processVideoToMp4)
+	router.POST("/convert-image-to-png", processImageToPng)
 
 	router.Run(":" + port)
 }
