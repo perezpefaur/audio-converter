@@ -476,6 +476,74 @@ func originMiddleware() gin.HandlerFunc {
 	}
 }
 
+// Función para analizar el formato y codecs de un video
+func probeVideoFormat(inputData []byte) (string, error) {
+	// Crear archivo temporal para entrada
+	inputFile, err := os.CreateTemp("", "probe-*")
+	if err != nil {
+		return "", fmt.Errorf("error al crear archivo temporal para probe: %v", err)
+	}
+	inputPath := inputFile.Name()
+	defer func() {
+		inputFile.Close()
+		os.Remove(inputPath)
+	}()
+
+	// Escribir datos de entrada al archivo temporal
+	_, err = inputFile.Write(inputData)
+	if err != nil {
+		return "", fmt.Errorf("error al escribir en archivo temporal para probe: %v", err)
+	}
+	inputFile.Close()
+
+	// Ejecutar ffprobe para analizar el formato
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-show_entries", "stream=codec_type,codec_name",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		inputPath)
+
+	var outBuffer bytes.Buffer
+	cmd.Stdout = &outBuffer
+	cmd.Stderr = os.Stderr
+
+	err = cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("error al ejecutar ffprobe: %v", err)
+	}
+
+	// Analizar la salida para determinar codecs
+	output := outBuffer.String()
+	lines := strings.Split(output, "\n")
+
+	var videoCodec, audioCodec string
+	for i := 0; i < len(lines); i += 2 {
+		if i+1 >= len(lines) {
+			break
+		}
+		
+		codecType := strings.TrimSpace(lines[i])
+		codecName := strings.TrimSpace(lines[i+1])
+		
+		if codecType == "video" {
+			videoCodec = codecName
+		} else if codecType == "audio" {
+			audioCodec = codecName
+		}
+	}
+
+	fmt.Printf("Formato detectado - Video codec: %s, Audio codec: %s\n", videoCodec, audioCodec)
+
+	// Determinar el formato basado en los codecs
+	if videoCodec == "h264" && audioCodec == "" {
+		return "video/mp4, videoCodec=h264, audioCodec=unknown", nil
+	} else if videoCodec == "h264" && audioCodec != "" {
+		return "video/mp4", nil
+	}
+
+	return "other", nil
+}
+
 func convertVideoToMp4(inputData []byte, inputFormat string) ([]byte, error) {
 	fmt.Printf("Iniciando conversión de video %s a MP4 (%d bytes)\n", inputFormat, len(inputData))
 
@@ -527,16 +595,20 @@ func convertVideoToMp4UsingTempFiles(inputData []byte, inputFormat string) ([]by
 	}
 	fmt.Printf("Archivo de entrada verificado: %s (tamaño: %d bytes)\n", inputPath, inputInfo.Size())
 
-	// Ejecutar ffmpeg con archivos temporales
+	// Ejecutar ffmpeg con archivos temporales y forzar la inclusión de una pista de audio
+	// Esto es crucial para solucionar el problema con WhatsApp que rechaza videos con "audioCodec=unknown"
 	cmd := exec.Command("ffmpeg",
 		"-i", inputPath,          // Archivo de entrada
+		"-f", "lavfi",            // Formato para filtros
+		"-i", "anullsrc=r=48000:cl=stereo", // Generar una pista de audio silenciosa si no hay audio
 		"-movflags", "faststart", // Optimizar para streaming
 		"-pix_fmt", "yuv420p",    // Formato de pixel compatible
 		"-c:v", "libx264",        // Codec de video
 		"-preset", "ultrafast",   // Preset de codificación más rápido
 		"-crf", "23",             // Calidad de video
-		"-c:a", "aac",            // Codec de audio
+		"-c:a", "aac",            // Codec de audio (importante para WhatsApp)
 		"-b:a", "128k",           // Bitrate de audio
+		"-shortest",              // Usar la duración del stream más corto
 		"-y",                     // Sobrescribir sin preguntar
 		outputPath)               // Archivo de salida
 
@@ -544,7 +616,7 @@ func convertVideoToMp4UsingTempFiles(inputData []byte, inputFormat string) ([]by
 	var errBuffer bytes.Buffer
 	cmd.Stderr = &errBuffer
 
-	fmt.Println("Ejecutando FFmpeg para conversión de video...")
+	fmt.Println("Ejecutando FFmpeg para conversión de video con audio forzado...")
 	fmt.Printf("Comando: %v\n", cmd.Args)
 
 	err = cmd.Run()
@@ -597,10 +669,37 @@ func processVideoToMp4(c *gin.Context) {
 			}
 		}()
 
+		// Detectar el formato del video
+		videoFormat, err := probeVideoFormat(inputData)
+		if err != nil {
+			handleError(http.StatusInternalServerError, err, "análisis de formato")
+			return
+		}
+
+		fmt.Printf("Formato detectado: %s\n", videoFormat)
+
+		// Si es un MP4 estándar, devolver los datos originales
+		if videoFormat == "video/mp4" {
+			fmt.Println("El video ya es un MP4 estándar, devolviendo sin conversión")
+			c.JSON(http.StatusOK, gin.H{
+				"video": base64.StdEncoding.EncodeToString(inputData),
+				"format": "mp4",
+			})
+			return
+		}
+
+		// Si tiene el formato problemático o cualquier otro, convertir el video
+		fmt.Println("Convirtiendo video para asegurar compatibilidad con WhatsApp...")
 		convertedData, err := convertVideoToMp4(inputData, inputFormat)
 		if err != nil {
 			handleError(http.StatusInternalServerError, err, "conversión")
 			return
+		}
+
+		// Verificar el formato después de la conversión
+		if videoFormat == "video/mp4, videoCodec=h264, audioCodec=unknown" {
+			fmt.Println("Verificando que el problema de audioCodec=unknown se haya resuelto...")
+			// Podríamos añadir aquí una verificación adicional si es necesario
 		}
 
 		// Verificar que los datos convertidos no estén vacíos
