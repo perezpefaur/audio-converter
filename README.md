@@ -8,7 +8,7 @@ Before starting, you'll need to have the following installed:
 
 - [Go](https://golang.org/doc/install) (version 1.21 or higher)
 - [Docker](https://docs.docker.com/get-docker/) (to run the project in a container)
-- [FFmpeg](https://ffmpeg.org/download.html) (for audio processing)
+- [FFmpeg](https://ffmpeg.org/download.html) (for audio processing).
 
 ## Installation
 
