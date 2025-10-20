@@ -80,12 +80,20 @@ func validateAPIKey(c *gin.Context) bool {
 	return true
 }
 
-func convertAudio(inputData []byte, inputFormat string, outputFormat string) ([]byte, int, error) {
-	fmt.Printf("Converting audio from %s to %s\n", inputFormat, outputFormat)
-	fmt.Printf("Input data size: %d bytes\n", len(inputData))
+func convertAudio(inputData []byte, outputFormat string) ([]byte, int, error) {
 	var cmd *exec.Cmd
 
 	switch outputFormat {
+
+	case "mp4":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-vn",
+			"-c:a",
+			"aac",
+			"-b:a", "128k",
+			"-f", "adts",
+			"pipe:1",
+		)
 	case "mp3":
 		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "mp3", "pipe:1")
 	case "wav":
@@ -97,7 +105,40 @@ func convertAudio(inputData []byte, inputFormat string, outputFormat string) ([]
 	case "m4a":
 		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-c:a", "aac", "-b:a", "128k", "-f", "ipod", "pipe:1")
 	default:
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-c:a", "libopus", "-b:a", "16k", "-vbr", "on", "-compression_level", "10", "-ac", "1", "-ar", "16000", "-f", "ogg", "pipe:1")
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-f",
+			"ogg",
+			"-vn",
+			"-c:a",
+			"libopus",
+			"-avoid_negative_ts",
+			"make_zero",
+			"-b:a",
+			"128k",
+			"-ar",
+			"48000",
+			"-ac",
+			"1",
+			"-write_xing",
+			"0",
+			"-compression_level",
+			"10",
+			"-application",
+			"voip",
+			"-fflags",
+			"+bitexact",
+			"-flags",
+			"+bitexact",
+			"-id3v2_version",
+			"0",
+			"-map_metadata",
+			"-1",
+			"-map_chapters",
+			"-1",
+			"-write_bext",
+			"0",
+			"pipe:1",
+		)
 	}
 
 	outBuffer := bufferPool.Get().(*bytes.Buffer)
@@ -128,7 +169,12 @@ func convertAudio(inputData []byte, inputFormat string, outputFormat string) ([]
 	}
 
 	re := regexp.MustCompile(`(\d+):(\d+):(\d+\.\d+)`)
-	matches := re.FindStringSubmatch(splitTime[2])
+	var matches []string
+	if (len(splitTime) == 2) {
+		matches = re.FindStringSubmatch(splitTime[1])
+	} else {
+		matches = re.FindStringSubmatch(splitTime[2])
+	}
 	if len(matches) != 4 {
 		return nil, 0, errors.New("duration format not found")
 	}
@@ -335,10 +381,9 @@ func processAudio(c *gin.Context) {
 		return
 	}
 
-	inputFormat := c.DefaultPostForm("input_format", "ogg")
 	outputFormat := c.DefaultPostForm("output_format", "ogg")
 
-	convertedData, duration, err := convertAudio(inputData, inputFormat, outputFormat)
+	convertedData, duration, err := convertAudio(inputData, outputFormat)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
