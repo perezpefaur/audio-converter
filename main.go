@@ -529,11 +529,6 @@ func validateOrigin(origin string) bool {
 func originMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		origin := c.Request.Header.Get("Origin")
-		fmt.Printf("\n=== CORS Debug ===\n")
-		fmt.Printf("Received origin: %s\n", origin)
-		fmt.Printf("Complete headers: %+v\n", c.Request.Header)
-		fmt.Printf("Allowed origins: %v\n", allowedOrigins)
-		fmt.Printf("=================\n")
 
 		if origin == "" {
 			origin = c.Request.Header.Get("Referer")
@@ -541,13 +536,13 @@ func originMiddleware() gin.HandlerFunc {
 		}
 
 		if !validateOrigin(origin) {
-			fmt.Printf("❌ Origin rejected: %s\n", origin)
+			fmt.Printf("Origin rejected: %s\n", origin)
 			c.JSON(http.StatusForbidden, gin.H{"error": "Origin not allowed"})
 			c.Abort()
 			return
 		}
 
-		fmt.Printf("✅ Origin accepted: %s\n", origin)
+		fmt.Printf("Origin accepted: %s\n", origin)
 		c.Next()
 	}
 }
