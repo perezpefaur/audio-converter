@@ -33,54 +33,67 @@ var (
 )
 
 func init() {
-	devMode := flag.Bool("dev", false, "Rodar em modo de desenvolvimento")
+	devMode := flag.Bool("dev", false, "Run in development mode")
 	flag.Parse()
 
 	if *devMode {
 		err := godotenv.Load()
 		if err != nil {
-			fmt.Println("Erro ao carregar o arquivo .env")
+			fmt.Println("Error loading .env file")
 		} else {
-			fmt.Println("Arquivo .env carregado com sucesso")
+			fmt.Println(".env file loaded successfully")
 		}
 	}
 
 	apiKey = os.Getenv("API_KEY")
 	if apiKey == "" {
-		fmt.Println("API_KEY não configurada no arquivo .env")
+		fmt.Println("API_KEY not configured in .env file")
 	}
 
 	allowOriginsEnv := os.Getenv("CORS_ALLOW_ORIGINS")
 	if allowOriginsEnv != "" {
 		allowedOrigins = strings.Split(allowOriginsEnv, ",")
+		fmt.Printf("Allowed origins: %v\n", allowedOrigins)
 	} else {
 		allowedOrigins = []string{"*"}
+		fmt.Printf("No allowed origins configured, allowing all")
 	}
 }
 
 func validateAPIKey(c *gin.Context) bool {
 	if apiKey == "" {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Erro interno no servidor"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error (no API_KEY configured)"})
 		return false
 	}
 
 	requestApiKey := c.GetHeader("apikey")
 	if requestApiKey == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "API_KEY não fornecida"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "API_KEY not provided"})
 		return false
 	}
 
 	if requestApiKey != apiKey {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "API_KEY inválida"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid API_KEY"})
 		return false
 	}
 
 	return true
 }
 
-func convertAudio(inputData []byte, inputFormat string, outputFormat string) ([]byte, int, error) {
+func convertAudio(inputData []byte, outputFormat string) ([]byte, int, error) {
 	var cmd *exec.Cmd
+
 	switch outputFormat {
+
+	case "mp4":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-vn",
+			"-c:a",
+			"aac",
+			"-b:a", "128k",
+			"-f", "adts",
+			"pipe:1",
+		)
 	case "mp3":
 		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "mp3", "pipe:1")
 	case "wav":
@@ -92,8 +105,42 @@ func convertAudio(inputData []byte, inputFormat string, outputFormat string) ([]
 	case "m4a":
 		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-c:a", "aac", "-b:a", "128k", "-f", "ipod", "pipe:1")
 	default:
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-c:a", "libopus", "-b:a", "16k", "-vbr", "on", "-compression_level", "10", "-ac", "1", "-ar", "16000", "-f", "ogg", "pipe:1")
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-f",
+			"ogg",
+			"-vn",
+			"-c:a",
+			"libopus",
+			"-avoid_negative_ts",
+			"make_zero",
+			"-b:a",
+			"128k",
+			"-ar",
+			"48000",
+			"-ac",
+			"1",
+			"-write_xing",
+			"0",
+			"-compression_level",
+			"10",
+			"-application",
+			"voip",
+			"-fflags",
+			"+bitexact",
+			"-flags",
+			"+bitexact",
+			"-id3v2_version",
+			"0",
+			"-map_metadata",
+			"-1",
+			"-map_chapters",
+			"-1",
+			"-write_bext",
+			"0",
+			"pipe:1",
+		)
 	}
+
 	outBuffer := bufferPool.Get().(*bytes.Buffer)
 	errBuffer := bufferPool.Get().(*bytes.Buffer)
 	defer bufferPool.Put(outBuffer)
@@ -114,18 +161,22 @@ func convertAudio(inputData []byte, inputFormat string, outputFormat string) ([]
 	convertedData := make([]byte, outBuffer.Len())
 	copy(convertedData, outBuffer.Bytes())
 
-	// Parsing da duração
 	outputText := errBuffer.String()
 	splitTime := strings.Split(outputText, "time=")
 
 	if len(splitTime) < 2 {
-		return nil, 0, errors.New("duração não encontrada")
+		return nil, 0, errors.New("duration not found")
 	}
 
 	re := regexp.MustCompile(`(\d+):(\d+):(\d+\.\d+)`)
-	matches := re.FindStringSubmatch(splitTime[2])
+	var matches []string
+	if (len(splitTime) == 2) {
+		matches = re.FindStringSubmatch(splitTime[1])
+	} else {
+		matches = re.FindStringSubmatch(splitTime[2])
+	}
 	if len(matches) != 4 {
-		return nil, 0, errors.New("formato de duração não encontrado")
+		return nil, 0, errors.New("duration format not found")
 	}
 
 	hours, _ := strconv.ParseFloat(matches[1], 64)
@@ -331,9 +382,8 @@ func processAudio(c *gin.Context) {
 	}
 
 	outputFormat := c.DefaultPostForm("output_format", "ogg")
-	inputFormat := c.DefaultPostForm("input_format", "ogg")
 
-	convertedData, duration, err := convertAudio(inputData, inputFormat, outputFormat)
+	convertedData, duration, err := convertAudio(inputData, outputFormat)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -448,30 +498,51 @@ func processGifToMp4(c *gin.Context) {
 }
 
 func validateOrigin(origin string) bool {
-	if len(allowedOrigins) == 0 || (len(allowedOrigins) == 1 && allowedOrigins[0] == "*") {
+	fmt.Printf("Validating origin: %s\n", origin)
+	fmt.Printf("Allowed origins: %v\n", allowedOrigins)
+
+	if len(allowedOrigins) == 0 {
+		return true
+	}
+
+	if origin == "" {
 		return true
 	}
 
 	for _, allowed := range allowedOrigins {
+		allowed = strings.TrimSpace(allowed)
+
+		if allowed == "*" {
+			return true
+		}
+
 		if allowed == origin {
+			fmt.Printf("Origin %s matches %s\n", origin, allowed)
 			return true
 		}
 	}
+
+	fmt.Printf("Origin %s not found in allowed origins\n", origin)
 	return false
 }
 
 func originMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		origin := c.Request.Header.Get("Origin")
+
 		if origin == "" {
 			origin = c.Request.Header.Get("Referer")
+			fmt.Printf("Empty origin, using Referer: %s\n", origin)
 		}
 
 		if !validateOrigin(origin) {
-			c.JSON(http.StatusForbidden, gin.H{"error": "Origem não permitida"})
+			fmt.Printf("Origin rejected: %s\n", origin)
+			c.JSON(http.StatusForbidden, gin.H{"error": "Origin not allowed"})
 			c.Abort()
 			return
 		}
+
+		fmt.Printf("Origin accepted: %s\n", origin)
 		c.Next()
 	}
 }
@@ -521,10 +592,10 @@ func probeVideoFormat(inputData []byte) (string, error) {
 		if i+1 >= len(lines) {
 			break
 		}
-		
+
 		codecType := strings.TrimSpace(lines[i])
 		codecName := strings.TrimSpace(lines[i+1])
-		
+
 		if codecType == "video" {
 			videoCodec = codecName
 		} else if codecType == "audio" {
@@ -1037,6 +1108,7 @@ func main() {
 	config.AllowOrigins = allowedOrigins
 	config.AllowMethods = []string{"POST", "GET", "OPTIONS"}
 	config.AllowHeaders = []string{"Origin", "Content-Type", "Accept", "Authorization", "apikey"}
+	config.AllowCredentials = true
 
 	router.Use(cors.New(config))
 	router.Use(originMiddleware())
