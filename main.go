@@ -80,66 +80,158 @@ func validateAPIKey(c *gin.Context) bool {
 	return true
 }
 
-func convertAudio(inputData []byte, outputFormat string) ([]byte, int, error) {
-	var cmd *exec.Cmd
+// isMP4orM4A detecta si los datos de entrada son un archivo MP4/M4A
+// basándose en la firma "ftyp" en los bytes 4-7 del archivo
+func isMP4orM4A(data []byte) bool {
+	if len(data) < 12 {
+		return false
+	}
+	// Los archivos MP4/M4A tienen "ftyp" en los bytes 4-7
+	return string(data[4:8]) == "ftyp"
+}
+
+// getFFmpegArgs retorna los argumentos de FFmpeg según el formato de salida
+// inputSource debe ser "pipe:0" para pipes o la ruta del archivo temporal
+func getFFmpegArgs(inputSource string, outputFormat string) []string {
+	baseArgs := []string{"-i", inputSource}
 
 	switch outputFormat {
-
 	case "mp4":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
-			"-vn",
-			"-c:a",
-			"aac",
-			"-b:a", "128k",
-			"-f", "adts",
-			"pipe:1",
-		)
+		return append(baseArgs, "-vn", "-c:a", "aac", "-b:a", "128k", "-f", "adts", "pipe:1")
 	case "mp3":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "mp3", "pipe:1")
+		return append(baseArgs, "-f", "mp3", "pipe:1")
 	case "wav":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-f", "wav", "pipe:1")
+		return append(baseArgs, "-f", "wav", "pipe:1")
 	case "aac":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-c:a", "aac", "-b:a", "128k", "-f", "adts", "pipe:1")
+		return append(baseArgs, "-c:a", "aac", "-b:a", "128k", "-f", "adts", "pipe:1")
 	case "amr":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-c:a", "libopencore_amrnb", "-b:a", "12.2k", "-f", "amr", "pipe:1")
+		return append(baseArgs, "-c:a", "libopencore_amrnb", "-b:a", "12.2k", "-f", "amr", "pipe:1")
 	case "m4a":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0", "-c:a", "aac", "-b:a", "128k", "-f", "ipod", "pipe:1")
-	default:
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
-			"-f",
-			"ogg",
+		return append(baseArgs, "-c:a", "aac", "-b:a", "128k", "-f", "ipod", "pipe:1")
+	default: // ogg
+		return append(baseArgs,
+			"-f", "ogg",
 			"-vn",
-			"-c:a",
-			"libopus",
-			"-avoid_negative_ts",
-			"make_zero",
-			"-b:a",
-			"128k",
-			"-ar",
-			"48000",
-			"-ac",
-			"1",
-			"-write_xing",
-			"0",
-			"-compression_level",
-			"10",
-			"-application",
-			"voip",
-			"-fflags",
-			"+bitexact",
-			"-flags",
-			"+bitexact",
-			"-id3v2_version",
-			"0",
-			"-map_metadata",
-			"-1",
-			"-map_chapters",
-			"-1",
-			"-write_bext",
-			"0",
+			"-c:a", "libopus",
+			"-avoid_negative_ts", "make_zero",
+			"-b:a", "128k",
+			"-ar", "48000",
+			"-ac", "1",
+			"-write_xing", "0",
+			"-compression_level", "10",
+			"-application", "voip",
+			"-fflags", "+bitexact",
+			"-flags", "+bitexact",
+			"-id3v2_version", "0",
+			"-map_metadata", "-1",
+			"-map_chapters", "-1",
+			"-write_bext", "0",
 			"pipe:1",
 		)
 	}
+}
+
+// extractDuration extrae la duración del stderr de FFmpeg
+func extractDuration(stderrOutput string) (int, error) {
+	splitTime := strings.Split(stderrOutput, "time=")
+	if len(splitTime) < 2 {
+		return 0, errors.New("duration not found")
+	}
+
+	re := regexp.MustCompile(`(\d+):(\d+):(\d+\.\d+)`)
+	var matches []string
+	if len(splitTime) == 2 {
+		matches = re.FindStringSubmatch(splitTime[1])
+	} else {
+		matches = re.FindStringSubmatch(splitTime[2])
+	}
+
+	if len(matches) != 4 {
+		return 0, errors.New("duration format not found")
+	}
+
+	hours, _ := strconv.ParseFloat(matches[1], 64)
+	minutes, _ := strconv.ParseFloat(matches[2], 64)
+	seconds, _ := strconv.ParseFloat(matches[3], 64)
+	duration := int(hours*3600 + minutes*60 + seconds)
+
+	return duration, nil
+}
+
+// convertAudioWithTempFile convierte audio usando archivo temporal para la entrada
+// Necesario para formatos MP4/M4A que tienen el "moov atom" al final
+func convertAudioWithTempFile(inputData []byte, outputFormat string) ([]byte, int, error) {
+	fmt.Println("[convertAudio] Usando archivo temporal (formato MP4/M4A detectado)")
+
+	// Crear archivo temporal para entrada
+	inputFile, err := os.CreateTemp("", "audio-input-*.m4a")
+	if err != nil {
+		return nil, 0, fmt.Errorf("error creating temp input file: %v", err)
+	}
+	inputPath := inputFile.Name()
+	defer func() {
+		inputFile.Close()
+		os.Remove(inputPath)
+		fmt.Printf("[convertAudio] Archivo temporal eliminado: %s\n", inputPath)
+	}()
+
+	// Escribir datos de entrada al archivo temporal
+	bytesWritten, err := inputFile.Write(inputData)
+	if err != nil {
+		return nil, 0, fmt.Errorf("error writing to temp file: %v", err)
+	}
+	fmt.Printf("[convertAudio] Datos escritos en archivo temporal: %d bytes en %s\n", bytesWritten, inputPath)
+	inputFile.Close()
+
+	// Construir comando FFmpeg con archivo temporal como entrada
+	args := getFFmpegArgs(inputPath, outputFormat)
+	cmd := exec.Command("ffmpeg", args...)
+
+	outBuffer := bufferPool.Get().(*bytes.Buffer)
+	errBuffer := bufferPool.Get().(*bytes.Buffer)
+	defer bufferPool.Put(outBuffer)
+	defer bufferPool.Put(errBuffer)
+
+	outBuffer.Reset()
+	errBuffer.Reset()
+
+	cmd.Stdout = outBuffer
+	cmd.Stderr = errBuffer
+
+	fmt.Printf("[convertAudio] Ejecutando: ffmpeg %v\n", args)
+	err = cmd.Run()
+	stderrOutput := errBuffer.String()
+
+	if err != nil {
+		fmt.Printf("[convertAudio] Error FFmpeg: %v\n", err)
+		fmt.Printf("[convertAudio] Stderr: %s\n", stderrOutput)
+		return nil, 0, fmt.Errorf("error during conversion: %v, details: %s", err, stderrOutput)
+	}
+
+	if outBuffer.Len() == 0 {
+		fmt.Println("[convertAudio] Error: salida vacía después de conversión")
+		return nil, 0, errors.New("conversion produced empty output")
+	}
+
+	convertedData := make([]byte, outBuffer.Len())
+	copy(convertedData, outBuffer.Bytes())
+
+	duration, err := extractDuration(stderrOutput)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	fmt.Printf("[convertAudio] Conversión exitosa: %d bytes, duración %d segundos\n", len(convertedData), duration)
+	return convertedData, duration, nil
+}
+
+// convertAudioWithPipe convierte audio usando pipes (método original)
+// Más eficiente para formatos que no requieren seek (wav, mp3, ogg, etc.)
+func convertAudioWithPipe(inputData []byte, outputFormat string) ([]byte, int, error) {
+	fmt.Println("[convertAudio] Usando pipes (formato estándar)")
+
+	args := getFFmpegArgs("pipe:0", outputFormat)
+	cmd := exec.Command("ffmpeg", args...)
 
 	outBuffer := bufferPool.Get().(*bytes.Buffer)
 	errBuffer := bufferPool.Get().(*bytes.Buffer)
@@ -153,38 +245,49 @@ func convertAudio(inputData []byte, outputFormat string) ([]byte, int, error) {
 	cmd.Stdout = outBuffer
 	cmd.Stderr = errBuffer
 
+	fmt.Printf("[convertAudio] Ejecutando: ffmpeg %v\n", args)
 	err := cmd.Run()
+	stderrOutput := errBuffer.String()
+
 	if err != nil {
-		return nil, 0, fmt.Errorf("error during conversion: %v, details: %s", err, errBuffer.String())
+		fmt.Printf("[convertAudio] Error FFmpeg: %v\n", err)
+		fmt.Printf("[convertAudio] Stderr: %s\n", stderrOutput)
+		return nil, 0, fmt.Errorf("error during conversion: %v, details: %s", err, stderrOutput)
+	}
+
+	if outBuffer.Len() == 0 {
+		fmt.Println("[convertAudio] Error: salida vacía después de conversión")
+		return nil, 0, errors.New("conversion produced empty output")
 	}
 
 	convertedData := make([]byte, outBuffer.Len())
 	copy(convertedData, outBuffer.Bytes())
 
-	outputText := errBuffer.String()
-	splitTime := strings.Split(outputText, "time=")
-
-	if len(splitTime) < 2 {
-		return nil, 0, errors.New("duration not found")
+	duration, err := extractDuration(stderrOutput)
+	if err != nil {
+		return nil, 0, err
 	}
 
-	re := regexp.MustCompile(`(\d+):(\d+):(\d+\.\d+)`)
-	var matches []string
-	if (len(splitTime) == 2) {
-		matches = re.FindStringSubmatch(splitTime[1])
-	} else {
-		matches = re.FindStringSubmatch(splitTime[2])
-	}
-	if len(matches) != 4 {
-		return nil, 0, errors.New("duration format not found")
-	}
-
-	hours, _ := strconv.ParseFloat(matches[1], 64)
-	minutes, _ := strconv.ParseFloat(matches[2], 64)
-	seconds, _ := strconv.ParseFloat(matches[3], 64)
-	duration := int(hours*3600 + minutes*60 + seconds)
-
+	fmt.Printf("[convertAudio] Conversión exitosa: %d bytes, duración %d segundos\n", len(convertedData), duration)
 	return convertedData, duration, nil
+}
+
+func convertAudio(inputData []byte, outputFormat string) ([]byte, int, error) {
+	fmt.Printf("[convertAudio] Iniciando conversión. Tamaño entrada: %d bytes, Formato salida: %s\n", len(inputData), outputFormat)
+
+	if len(inputData) == 0 {
+		return nil, 0, errors.New("empty input data")
+	}
+
+	// Detectar si es MP4/M4A - estos formatos tienen el "moov atom" al final
+	// y requieren seek, por lo que no pueden usar pipes
+	if isMP4orM4A(inputData) {
+		fmt.Println("[convertAudio] Formato MP4/M4A detectado (ftyp signature encontrada)")
+		return convertAudioWithTempFile(inputData, outputFormat)
+	}
+
+	fmt.Println("[convertAudio] Formato estándar detectado, usando pipes")
+	return convertAudioWithPipe(inputData, outputFormat)
 }
 
 func fetchAudioFromURL(url string) ([]byte, error) {
