@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -1199,6 +1200,177 @@ func processImageToPng(c *gin.Context) {
 	processConversion(inputData, "otros métodos")
 }
 
+const (
+	frameOffsetPrimarySeconds  = "1"   // primer intento: frame del segundo 1
+	frameOffsetFallbackSeconds = "0.5" // fallback: frame del medio segundo
+	frameExtractionTimeout     = 15 * time.Second
+	maxFrameBytes              = 10 * 1024 * 1024
+)
+
+// extractVideoFrame extrae un único frame del video como JPEG.
+// Intenta primero en el segundo 1 y, si falla, reintenta en el segundo 0.5.
+func extractVideoFrame(inputData []byte) ([]byte, error) {
+	fmt.Printf("Iniciando extracción de frame de video (%d bytes)\n", len(inputData))
+
+	if len(inputData) == 0 {
+		return nil, errors.New("datos de entrada vacíos")
+	}
+
+	frame, err := extractVideoFrameAtOffset(inputData, frameOffsetPrimarySeconds)
+	if err == nil {
+		return frame, nil
+	}
+
+	fmt.Printf("Fallo extracción en %ss, reintentando en %ss: %v\n",
+		frameOffsetPrimarySeconds, frameOffsetFallbackSeconds, err)
+	return extractVideoFrameAtOffset(inputData, frameOffsetFallbackSeconds)
+}
+
+// extractVideoFrameAtOffset corre ffmpeg sobre un archivo temporal y devuelve
+// el frame ubicado en offsetSeconds. El seek va antes de -i para que sea rápido.
+func extractVideoFrameAtOffset(inputData []byte, offsetSeconds string) ([]byte, error) {
+	inputFile, err := os.CreateTemp("", "frame-input-*")
+	if err != nil {
+		return nil, fmt.Errorf("error al crear archivo temporal de entrada: %v", err)
+	}
+	inputPath := inputFile.Name()
+	defer func() {
+		inputFile.Close()
+		os.Remove(inputPath)
+	}()
+
+	if _, err := inputFile.Write(inputData); err != nil {
+		return nil, fmt.Errorf("error al escribir en archivo temporal: %v", err)
+	}
+	inputFile.Close()
+
+	outputFile, err := os.CreateTemp("", "frame-output-*.jpg")
+	if err != nil {
+		return nil, fmt.Errorf("error al crear archivo temporal de salida: %v", err)
+	}
+	outputPath := outputFile.Name()
+	outputFile.Close()
+	defer os.Remove(outputPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), frameExtractionTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx,
+		"ffmpeg",
+		"-ss", offsetSeconds, // seek antes de -i: rápido, por keyframe
+		"-i", inputPath,
+		"-frames:v", "1", // un solo frame
+		"-q:v", "2", // calidad alta del JPEG
+		"-c:v", "mjpeg",
+		"-f", "image2",
+		"-y", // sobrescribir sin preguntar
+		outputPath,
+	)
+
+	var errBuffer bytes.Buffer
+	cmd.Stderr = &errBuffer
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("error al extraer frame en %ss: %v, detalles: %s",
+			offsetSeconds, err, errBuffer.String())
+	}
+
+	outputData, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("error al leer frame de salida: %v", err)
+	}
+
+	if len(outputData) == 0 {
+		return nil, errors.New("la extracción produjo un frame vacío")
+	}
+
+	if len(outputData) > maxFrameBytes {
+		return nil, fmt.Errorf("el frame supera el tamaño máximo permitido (%d bytes)", maxFrameBytes)
+	}
+
+	return outputData, nil
+}
+
+func processVideoToFrame(c *gin.Context) {
+	handleError := func(statusCode int, err error, source string) {
+		fmt.Printf("Error en %s: %v\n", source, err)
+		c.JSON(statusCode, gin.H{"error": err.Error()})
+	}
+
+	processExtraction := func(inputData []byte, source string) {
+		fmt.Printf("Procesando frame de video desde %s (%d bytes)\n", source, len(inputData))
+
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Recuperado de pánico en extracción: %v\n", r)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": fmt.Sprintf("Error interno durante la extracción: %v", r),
+				})
+			}
+		}()
+
+		frameData, err := extractVideoFrame(inputData)
+		if err != nil {
+			handleError(http.StatusInternalServerError, err, "extracción")
+			return
+		}
+
+		fmt.Printf("Extracción exitosa. Enviando frame (%d bytes)\n", len(frameData))
+		c.JSON(http.StatusOK, gin.H{
+			"image":  base64.StdEncoding.EncodeToString(frameData),
+			"format": "jpeg",
+		})
+	}
+
+	if !validateAPIKey(c) {
+		return
+	}
+
+	fmt.Printf("Recibida solicitud de extracción de frame. Content-Type: %s\n", c.ContentType())
+
+	formUrl := c.PostForm("url")
+	if formUrl != "" {
+		inputData, err := fetchAudioFromURL(formUrl)
+		if err != nil {
+			handleError(http.StatusBadRequest, err, "obtención de video (form)")
+			return
+		}
+		processExtraction(inputData, "form-data")
+		return
+	}
+
+	queryUrl := c.Query("url")
+	if queryUrl != "" {
+		inputData, err := fetchAudioFromURL(queryUrl)
+		if err != nil {
+			handleError(http.StatusBadRequest, err, "obtención de video (query)")
+			return
+		}
+		processExtraction(inputData, "query params")
+		return
+	}
+
+	var jsonData struct {
+		URL string `json:"url"`
+	}
+	if err := c.ShouldBindJSON(&jsonData); err == nil && jsonData.URL != "" {
+		inputData, err := fetchAudioFromURL(jsonData.URL)
+		if err != nil {
+			handleError(http.StatusBadRequest, err, "obtención de video (json)")
+			return
+		}
+		processExtraction(inputData, "JSON")
+		return
+	}
+
+	inputData, err := getInputData(c)
+	if err != nil {
+		handleError(http.StatusBadRequest, err, "obtención de datos de entrada")
+		return
+	}
+	processExtraction(inputData, "otros métodos")
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -1220,6 +1392,7 @@ func main() {
 	router.POST("/gif-to-mp4", processGifToMp4)
 	router.POST("/video-to-mp4", processVideoToMp4)
 	router.POST("/convert-image-to-png", processImageToPng)
+	router.POST("/video-to-frame", processVideoToFrame)
 
 	router.Run(":" + port)
 }
