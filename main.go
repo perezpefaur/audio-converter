@@ -1201,8 +1201,8 @@ func processImageToPng(c *gin.Context) {
 }
 
 const (
-	frameOffsetPrimarySeconds  = "1"   // primer intento: frame del segundo 1
-	frameOffsetFallbackSeconds = "0.5" // fallback: frame del medio segundo
+	frameOffsetPrimarySeconds  = "3"   // primer intento: frame del segundo 1
+	frameOffsetFallbackSeconds = "1" // fallback: frame del medio segundo
 	frameExtractionTimeout     = 15 * time.Second
 	maxFrameBytes              = 10 * 1024 * 1024
 )
